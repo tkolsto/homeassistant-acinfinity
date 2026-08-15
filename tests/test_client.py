@@ -265,6 +265,64 @@ class TestACInfinityClient:
         with pytest.raises(ACInfinityClientCannotConnect):
             await client.update_device_controls(DEVICE_ID, 1, {DeviceControlKey.ON_SPEED: 5})
 
+    async def test_update_device_controls_skipped_when_values_already_match(self):
+        """When the requested values already match the existing settings, no update call is made.
+        Home Assistant does not dedupe same-value service calls, and redundant writes can trip
+        the AC Infinity API's failure window (#109)."""
+        client = ACInfinityClient(HOST, EMAIL, PASSWORD)
+        client._user_id = USER_ID
+        try:
+            with aioresponses() as mocked:
+                mocked.post(
+                    re.compile(rf"{HOST}{API_URL_GET_DEV_MODE_SETTING}.*"),
+                    status=200,
+                    payload=GET_DEV_MODE_SETTING_LIST_PAYLOAD,
+                )
+
+                await client.update_device_controls(
+                    DEVICE_ID, 4, {DeviceControlKey.ON_SPEED: DEVICE_CONTROLS[DeviceControlKey.ON_SPEED]}
+                )
+
+                for method, url in mocked.requests.keys():
+                    assert API_URL_ADD_DEV_MODE not in str(url), "No-op update should not call the update endpoint"
+        finally:
+            await client.close()
+
+    async def test_update_device_controls_write_spacing_applied_between_consecutive_writes(self, mocker):
+        """Consecutive writes are spaced out to avoid the API failure window triggered by
+        back to back update calls (#39, #109)."""
+        client = ACInfinityClient(HOST, EMAIL, PASSWORD)
+        client._user_id = USER_ID
+
+        sleep_mock = mocker.patch("custom_components.ac_infinity.client.asyncio.sleep")
+        mocker.patch(
+            "custom_components.ac_infinity.client.monotonic",
+            side_effect=[100.0, 101.0, 106.0],
+        )
+        try:
+            with aioresponses() as mocked:
+                mocked.post(
+                    re.compile(rf"{HOST}{API_URL_GET_DEV_MODE_SETTING}.*"),
+                    status=200,
+                    payload=GET_DEV_MODE_SETTING_LIST_PAYLOAD,
+                    repeat=True,
+                )
+
+                mocked.post(
+                    re.compile(f"{HOST}{API_URL_ADD_DEV_MODE}.*"),
+                    status=200,
+                    payload=UPDATE_SUCCESS_PAYLOAD,
+                    repeat=True,
+                )
+
+                await client.update_device_controls(DEVICE_ID, 4, {DeviceControlKey.ON_SPEED: 2})
+                await client.update_device_controls(DEVICE_ID, 4, {DeviceControlKey.ON_SPEED: 3})
+        finally:
+            await client.close()
+
+        sleep_mock.assert_awaited_once()
+        assert sleep_mock.await_args.args[0] == pytest.approx(4.0)
+
     @pytest.mark.parametrize("port", [0, 1, 2, 3, 4])
     async def test_get_device_settings_returns_settings(self, port: int):
         """When logged in, get controller settings should return the current settings"""
@@ -404,6 +462,30 @@ class TestACInfinityClient:
         assert AdvancedSettingsKey.DEV_NAME in payload
         assert payload[AdvancedSettingsKey.DEV_NAME] == DEVICE_NAME
 
+    async def test_update_device_settings_skipped_when_values_already_match(self):
+        """When the requested values already match the existing settings, no update call is made."""
+        client = ACInfinityClient(HOST, EMAIL, PASSWORD)
+        client._user_id = USER_ID
+        try:
+            with aioresponses() as mocked:
+                mocked.post(
+                    re.compile(rf"{HOST}{API_URL_GET_DEV_SETTING}"),
+                    status=200,
+                    payload=GET_DEV_SETTINGS_PAYLOAD,
+                )
+
+                await client.update_device_settings(
+                    DEVICE_ID,
+                    0,
+                    DEVICE_NAME,
+                    {AdvancedSettingsKey.CALIBRATE_HUMIDITY: DEVICE_SETTINGS[AdvancedSettingsKey.CALIBRATE_HUMIDITY]},
+                )
+
+                for method, url in mocked.requests.keys():
+                    assert API_URL_UPDATE_ADV_SETTING not in str(url), "No-op update should not call the update endpoint"
+        finally:
+            await client.close()
+
     @staticmethod
     async def __make_generic_update_ai_device_control_and_settings_call_and_get_sent_payload(
         dev_mode_payload=GET_DEV_MODE_SETTING_LIST_PAYLOAD,
@@ -465,6 +547,32 @@ class TestACInfinityClient:
         )
 
         assert payload[DeviceControlKey.ON_SPEED] == '3'
+
+    async def test_update_ai_device_control_and_settings_skipped_when_values_already_match(self):
+        """When the requested values already match the existing settings, no update call is made."""
+        client = ACInfinityClient(HOST, EMAIL, PASSWORD)
+        client._user_id = USER_ID
+        try:
+            with aioresponses() as mocked:
+                mocked.post(
+                    re.compile(rf"{HOST}{API_URL_GET_DEV_MODE_SETTING}.*"),
+                    status=200,
+                    payload=GET_DEV_MODE_SETTING_LIST_PAYLOAD,
+                )
+
+                await client.update_ai_device_control_and_settings(
+                    DEVICE_ID,
+                    1,
+                    {
+                        DeviceControlKey.AT_TYPE: DEVICE_CONTROLS[DeviceControlKey.AT_TYPE],
+                        DeviceControlKey.ON_SPEED: DEVICE_CONTROLS[DeviceControlKey.ON_SPEED],
+                    },
+                )
+
+                for method, url in mocked.requests.keys():
+                    assert API_URL_MODE_AND_SETTINGS not in str(url), "No-op update should not call the update endpoint"
+        finally:
+            await client.close()
 
     async def test_update_ai_device_control_and_settings_connect_error_on_not_logged_in(self):
         """When not logged in, update AI device control and settings should throw a connect error"""

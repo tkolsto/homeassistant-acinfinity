@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+from time import monotonic
 from urllib.parse import urlencode
 
 import aiohttp
@@ -18,6 +20,11 @@ API_URL_MODE_AND_SETTINGS = "/api/dev/modeAndSetting"
 API_URL_GET_DEV_SETTING = "/api/dev/getDevSetting"
 API_URL_UPDATE_ADV_SETTING = "/api/dev/updateAdvSetting"
 
+# Minimum delay between consecutive write requests to the AC Infinity API.  Writes
+# issued back to back can trip a server-side failure window in which subsequent
+# update calls are rejected with code 100001 (see issues #39 and #109).
+MINIMUM_WRITE_SPACING_SECONDS = 5.0
+
 
 class ACInfinityClient:
     """Encapsulates http calls to the AC Infinity API"""
@@ -34,6 +41,8 @@ class ACInfinityClient:
         self._password = password
         self._user_id: str | None = None
         self._session: aiohttp.ClientSession | None = None
+        self._write_lock = asyncio.Lock()
+        self._last_write_monotonic: float | None = None
 
     async def login(self):
         """Call the log in endpoint with the configured email and password, and obtain the user id to use for subsequent calls"""
@@ -116,19 +125,29 @@ class ACInfinityClient:
         self.__ensure_logged_in()
 
         headers = self.__create_headers(use_auth_token=True)
-        body = await self.__post(
-            API_URL_GET_DEV_MODE_SETTING, {"devId": controller_id, "port": device_port}, headers
-        )
-        existing_values = body["data"]
+        async with self._write_lock:
+            body = await self.__post(
+                API_URL_GET_DEV_MODE_SETTING, {"devId": controller_id, "port": device_port}, headers
+            )
+            existing_values = body["data"]
 
-        device_control_keys: list[str] = [
-            getattr(DeviceControlKey, attr)
-            for attr in dir(DeviceControlKey)
-            if not attr.startswith('_')
-        ]
+            device_control_keys: list[str] = [
+                getattr(DeviceControlKey, attr)
+                for attr in dir(DeviceControlKey)
+                if not attr.startswith('_')
+            ]
 
-        updated = self.__transfer_values(device_control_keys, key_values, existing_values)
-        _ = await self.__post(f"{API_URL_ADD_DEV_MODE}?{urlencode(updated)}", None, headers)
+            current = self.__transfer_values(device_control_keys, {}, existing_values)
+            updated = self.__transfer_values(device_control_keys, key_values, existing_values)
+            if updated == current:
+                _LOGGER.debug(
+                    "Skipping device control update for controller %s port %s; values already match",
+                    controller_id, device_port,
+                )
+                return
+
+            await self.__apply_write_spacing()
+            _ = await self.__post(f"{API_URL_ADD_DEV_MODE}?{urlencode(updated)}", None, headers)
 
     async def update_device_settings(
         self, controller_id: str | int, device_port: int, device_name: str, key_values: dict[str, int]
@@ -144,21 +163,31 @@ class ACInfinityClient:
         self.__ensure_logged_in()
 
         headers = self.__create_headers(use_auth_token=True)
-        body = await self.__post(
-            API_URL_GET_DEV_SETTING, {"devId": controller_id, "port": device_port}, headers
-        )
-        existing_values = body["data"]
+        async with self._write_lock:
+            body = await self.__post(
+                API_URL_GET_DEV_SETTING, {"devId": controller_id, "port": device_port}, headers
+            )
+            existing_values = body["data"]
 
-        device_settings_keys: list[str] = [
-            getattr(AdvancedSettingsKey, attr)
-            for attr in dir(AdvancedSettingsKey)
-            if not attr.startswith('_')
-        ]
+            device_settings_keys: list[str] = [
+                getattr(AdvancedSettingsKey, attr)
+                for attr in dir(AdvancedSettingsKey)
+                if not attr.startswith('_')
+            ]
 
-        updated = self.__transfer_values(device_settings_keys, key_values, existing_values)
-        updated[AdvancedSettingsKey.DEV_NAME] = device_name
+            current = self.__transfer_values(device_settings_keys, {}, existing_values)
+            current[AdvancedSettingsKey.DEV_NAME] = device_name
+            updated = self.__transfer_values(device_settings_keys, key_values, existing_values)
+            updated[AdvancedSettingsKey.DEV_NAME] = device_name
+            if updated == current:
+                _LOGGER.debug(
+                    "Skipping device settings update for controller %s port %s; values already match",
+                    controller_id, device_port,
+                )
+                return
 
-        _ = await self.__post(f"{API_URL_UPDATE_ADV_SETTING}?{urlencode(updated)}", None, headers)
+            await self.__apply_write_spacing()
+            _ = await self.__post(f"{API_URL_UPDATE_ADV_SETTING}?{urlencode(updated)}", None, headers)
 
     async def update_ai_device_control_and_settings(
         self, controller_id: str | int, device_port: int, key_values: dict[str, int]
@@ -173,6 +202,14 @@ class ACInfinityClient:
         self.__ensure_logged_in()
 
         headers = self.__create_headers(use_auth_token=True, use_min_version=True)
+        async with self._write_lock:
+            await self.__update_ai_device_control_and_settings_locked(
+                controller_id, device_port, key_values, headers
+            )
+
+    async def __update_ai_device_control_and_settings_locked(
+        self, controller_id: str | int, device_port: int, key_values: dict[str, int], headers: dict
+    ):
         body = await self.__post(
             API_URL_GET_DEV_MODE_SETTING, {"devId": controller_id, "port": device_port}, headers
         )
@@ -187,7 +224,14 @@ class ACInfinityClient:
             if not attr.startswith('_')
         ]
 
+        current = self.__transfer_values(device_control_keys, {}, flattened)
         updated = self.__transfer_values(device_control_keys, key_values, flattened)
+        if updated == current:
+            _LOGGER.debug(
+                "Skipping ai device control update for controller %s port %s; values already match",
+                controller_id, device_port,
+            )
+            return
 
         at_type = updated[DeviceControlKey.AT_TYPE]
         match at_type:
@@ -206,8 +250,17 @@ class ACInfinityClient:
             case _:
                 raise ValueError(f"Unable to find setting id string - Unknown atType {at_type}")
 
+        await self.__apply_write_spacing()
         url = f"{API_URL_MODE_AND_SETTINGS}?{urlencode(updated)}"
         _ = await self.__put(url, headers)
+
+    async def __apply_write_spacing(self) -> None:
+        """Wait until at least MINIMUM_WRITE_SPACING_SECONDS has passed since the last write request."""
+        if self._last_write_monotonic is not None:
+            remaining = MINIMUM_WRITE_SPACING_SECONDS - (monotonic() - self._last_write_monotonic)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+        self._last_write_monotonic = monotonic()
 
     async def close(self) -> None:
         """Close the session when done"""
